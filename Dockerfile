@@ -9,5 +9,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY bot.py .
+COPY server.py .
 
-CMD ["python", "bot.py"]
+# Expose port for Render (dummy web server)
+EXPOSE 10000
+
+CMD ["python", "server.py"]
