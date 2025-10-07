@@ -440,6 +440,12 @@ async def handle_video_voice(update: Update, context: ContextTypes.DEFAULT_TYPE)
     except Exception as e:
         logger.error(f"Error handling video voice: {e}")
 
+# Progress bar generator
+def get_progress_bar(percentage):
+    filled = int(percentage / 10)
+    empty = 10 - filled
+    return "▓" * filled + "░" * empty
+
 # Merge audios
 async def merge_audios(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -450,24 +456,53 @@ async def merge_audios(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.callback_query.answer()
     
-    # Update message - processing
-    await context.bot.edit_message_text(
-        chat_id=user_id,
-        message_id=user_data[user_id]['main_message_id'],
-        text="⏳ অডিও মার্জ করা হচ্ছে... অপেক্ষা করুন...",
-        parse_mode='Markdown'
-    )
+    main_msg_id = user_data[user_id]['main_message_id']
     
     try:
-        # Merge all audio files
+        # Step 1: Loading audio files (0-30%)
+        await context.bot.edit_message_text(
+            chat_id=user_id,
+            message_id=main_msg_id,
+            text=f"⏳ *অডিও মার্জ করা হচ্ছে...*\n\n{get_progress_bar(10)} 10%\n\n📂 অডিও ফাইল লোড করা হচ্ছে...",
+            parse_mode='Markdown'
+        )
+        
+        # Merge all audio files with progress
         combined = AudioSegment.empty()
-        for audio_path in user_data[user_id]['audio_files']:
+        total_files = len(user_data[user_id]['audio_files'])
+        
+        for idx, audio_path in enumerate(user_data[user_id]['audio_files']):
             audio = AudioSegment.from_file(audio_path)
             combined += audio
+            
+            # Update progress (30% to 70%)
+            progress = 30 + int((idx + 1) / total_files * 40)
+            await context.bot.edit_message_text(
+                chat_id=user_id,
+                message_id=main_msg_id,
+                text=f"⏳ *অডিও মার্জ করা হচ্ছে...*\n\n{get_progress_bar(progress)} {progress}%\n\n🔗 অডিও একত্রিত করা হচ্ছে... ({idx + 1}/{total_files})",
+                parse_mode='Markdown'
+            )
+        
+        # Step 2: Exporting (70-90%)
+        await context.bot.edit_message_text(
+            chat_id=user_id,
+            message_id=main_msg_id,
+            text=f"⏳ *অডিও মার্জ করা হচ্ছে...*\n\n{get_progress_bar(80)} 80%\n\n💾 ফাইল সংরক্ষণ করা হচ্ছে...",
+            parse_mode='Markdown'
+        )
         
         # Export merged audio
         output_path = f"merged_{user_id}.mp3"
         combined.export(output_path, format="mp3")
+        
+        # Step 3: Finalizing (90-100%)
+        await context.bot.edit_message_text(
+            chat_id=user_id,
+            message_id=main_msg_id,
+            text=f"⏳ *অডিও মার্জ করা হচ্ছে...*\n\n{get_progress_bar(100)} 100%\n\n✅ সম্পন্ন হয়েছে!",
+            parse_mode='Markdown'
+        )
         
         # Delete all user messages
         for msg_id in user_data[user_id]['user_messages']:
@@ -530,23 +565,40 @@ async def merge_audios(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Create video
 async def create_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    
-    # Update message - processing
-    await context.bot.edit_message_text(
-        chat_id=user_id,
-        message_id=user_data[user_id]['main_message_id'],
-        text="⏳ ভিডিও বানানো হচ্ছে... অপেক্ষা করুন...",
-        parse_mode='Markdown'
-    )
+    main_msg_id = user_data[user_id]['main_message_id']
     
     try:
+        # Step 1: Starting (0-20%)
+        await context.bot.edit_message_text(
+            chat_id=user_id,
+            message_id=main_msg_id,
+            text=f"⏳ *ভিডিও বানানো হচ্ছে...*\n\n{get_progress_bar(10)} 10%\n\n📂 ফাইল প্রস্তুত করা হচ্ছে...",
+            parse_mode='Markdown'
+        )
+        
         image_path = user_data[user_id]['image']
         audio_path = user_data[user_id]['audio']
         output_video = f"video_{user_id}.mp4"
         
+        # Step 2: Getting audio duration (20-40%)
+        await context.bot.edit_message_text(
+            chat_id=user_id,
+            message_id=main_msg_id,
+            text=f"⏳ *ভিডিও বানানো হচ্ছে...*\n\n{get_progress_bar(30)} 30%\n\n🎵 অডিও প্রসেস করা হচ্ছে...",
+            parse_mode='Markdown'
+        )
+        
         # Get audio duration
         audio = AudioSegment.from_file(audio_path)
         duration = len(audio) / 1000  # Convert to seconds
+        
+        # Step 3: Creating video (40-80%)
+        await context.bot.edit_message_text(
+            chat_id=user_id,
+            message_id=main_msg_id,
+            text=f"⏳ *ভিডিও বানানো হচ্ছে...*\n\n{get_progress_bar(60)} 60%\n\n🎬 ভিডিও রেন্ডার করা হচ্ছে...",
+            parse_mode='Markdown'
+        )
         
         # FFmpeg command to create video
         cmd = [
@@ -560,6 +612,22 @@ async def create_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         
         subprocess.run(cmd, check=True, capture_output=True)
+        
+        # Step 4: Finalizing (80-100%)
+        await context.bot.edit_message_text(
+            chat_id=user_id,
+            message_id=main_msg_id,
+            text=f"⏳ *ভিডিও বানানো হচ্ছে...*\n\n{get_progress_bar(90)} 90%\n\n💾 ভিডিও সংরক্ষণ করা হচ্ছে...",
+            parse_mode='Markdown'
+        )
+        
+        # Brief pause to show 100%
+        await context.bot.edit_message_text(
+            chat_id=user_id,
+            message_id=main_msg_id,
+            text=f"⏳ *ভিডিও বানানো হচ্ছে...*\n\n{get_progress_bar(100)} 100%\n\n✅ সম্পন্ন হয়েছে!",
+            parse_mode='Markdown'
+        )
         
         # Delete all user messages
         for msg_id in user_data[user_id]['user_messages']:
