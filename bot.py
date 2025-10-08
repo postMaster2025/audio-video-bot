@@ -107,8 +107,6 @@ async def cleanup_user_messages(context: ContextTypes.DEFAULT_TYPE, user_id):
     
     data = user_data[user_id]
     messages_to_delete = data.get('user_messages', [])
-    if 'status_message_id' in data:
-        messages_to_delete.append(data['status_message_id'])
 
     for msg_id in messages_to_delete:
         try:
@@ -123,17 +121,25 @@ async def reset_user(update: Update, context: ContextTypes.DEFAULT_TYPE, send_ne
     await cleanup_user_files(user_id)
     await cleanup_user_messages(context, user_id)
 
+    # Delete status message if exists
+    if user_id in user_data and 'status_message_id' in user_data[user_id]:
+        try:
+            await context.bot.delete_message(chat_id=user_id, message_id=user_data[user_id]['status_message_id'])
+        except Exception:
+            pass
+
     if user_id in user_data:
         del user_data[user_id]
         
     if send_new_menu:
         welcome_text = "আপনার আগের সেশন বাতিল করা হয়েছে।\n\nনিচের বাটন থেকে আপনার কাজ বেছে নিন:"
-        await context.bot.send_message(
+        msg = await context.bot.send_message(
             chat_id=user_id,
             text=welcome_text,
             reply_markup=get_main_menu(),
             parse_mode='Markdown'
         )
+        user_data[user_id] = {'status_message_id': msg.message_id}
 
 # --- Command and Action Handlers ---
 
@@ -144,28 +150,39 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if user_id in user_data:
         await cleanup_user_messages(context, user_id)
+        # Delete old status message
+        if 'status_message_id' in user_data[user_id]:
+            try:
+                await context.bot.delete_message(chat_id=user_id, message_id=user_data[user_id]['status_message_id'])
+            except Exception:
+                pass
         if user_id in user_data:
             del user_data[user_id]
 
     welcome_text = "🎵 *অডিও ভিডিও বট এ স্বাগতম!* 🎬\n\nআমি যা করতে পারি:\n━━━━━━━━━━━━━━━\n🎵 একাধিক অডিও একসাথে জোড়া লাগাতে পারি\n🎬 অডিও + ছবি দিয়ে ভিডিও বানাতে পারি\n\nনিচের বাটন থেকে আপনার কাজ বেছে নিন:"
     
     if update.message:
-        await update.message.reply_text(
-            welcome_text,
-            reply_markup=get_main_menu(),
-            parse_mode='Markdown'
-        )
-    elif update.callback_query:
-        await update.callback_query.answer()
-        await update.callback_query.message.reply_text(
-            welcome_text,
-            reply_markup=get_main_menu(),
-            parse_mode='Markdown'
-        )
+        # Delete user's command message
         try:
-            await update.callback_query.message.delete()
+            await update.message.delete()
         except Exception:
             pass
+        msg = await context.bot.send_message(
+            chat_id=user_id,
+            text=welcome_text,
+            reply_markup=get_main_menu(),
+            parse_mode='Markdown'
+        )
+        user_data[user_id] = {'status_message_id': msg.message_id}
+    elif update.callback_query:
+        await update.callback_query.answer()
+        await safe_edit_message(
+            context, user_id, update.callback_query.message.message_id,
+            welcome_text, get_main_menu()
+        )
+        if user_id not in user_data:
+            user_data[user_id] = {}
+        user_data[user_id]['status_message_id'] = update.callback_query.message.message_id
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handles all button clicks."""
@@ -196,21 +213,19 @@ async def start_merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Starts the audio merging process."""
     user_id = update.effective_user.id
     
-    try:
-        await update.callback_query.message.delete()
-    except Exception:
-        pass
+    # Clean up old user messages
+    await cleanup_user_messages(context, user_id)
 
     user_data[user_id] = {
         'mode': 'merge',
         'audio_files': [],
         'audio_names': [],
-        'user_messages': []
+        'user_messages': [],
+        'status_message_id': update.callback_query.message.message_id
     }
     
     text = "🎵 *অডিও মার্জ মোড*\n\nএখন যতগুলো ইচ্ছে অডিও/ভয়েস পাঠান। শেষ হলে \"সম্পন্ন করুন\" বাটনে ক্লিক করুন।"
-    status_message = await context.bot.send_message(user_id, text, reply_markup=get_done_button(), parse_mode='Markdown')
-    user_data[user_id]['status_message_id'] = status_message.message_id
+    await safe_edit_message(context, user_id, user_data[user_id]['status_message_id'], text, get_done_button())
 
 async def add_more_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Adds more audio to an existing merged file."""
@@ -219,56 +234,48 @@ async def add_more_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.callback_query.answer("❌ প্রথমে একটি অডিও মার্জ করুন!", show_alert=True)
         return
     
-    try:
-        await update.callback_query.message.delete()
-    except Exception:
-        pass
+    # Clean up old user messages
+    await cleanup_user_messages(context, user_id)
 
     user_data[user_id].update({
         'mode': 'add_more',
         'new_audio_files': [],
         'new_audio_names': [],
-        'user_messages': []
+        'user_messages': [],
+        'status_message_id': update.callback_query.message.message_id
     })
     
     text = "➕ *আরো অডিও যোগ করুন*\n\nনতুন অডিও/ভয়েস পাঠান। শেষ হলে \"সম্পন্ন করুন\" ক্লিক করুন।"
-    status_message = await context.bot.send_message(user_id, text, reply_markup=get_done_button(), parse_mode='Markdown')
-    user_data[user_id]['status_message_id'] = status_message.message_id
+    await safe_edit_message(context, user_id, user_data[user_id]['status_message_id'], text, get_done_button())
 
 async def start_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Starts the video creation process."""
     user_id = update.effective_user.id
-    try:
-        await update.callback_query.message.delete()
-    except Exception:
-        pass
+    
+    # Clean up old user messages
+    await cleanup_user_messages(context, user_id)
 
     user_data[user_id] = {
         'mode': 'video',
         'image': None,
         'audio': None,
-        'user_messages': []
+        'user_messages': [],
+        'status_message_id': update.callback_query.message.message_id
     }
     
     text = "🎬 *ভিডিও বানানোর মোড*\n\n📸 প্রথমে একটি ছবি পাঠান।\n\n✅ ছবি: ❌\n✅ অডিও: ❌"
-    status_message = await context.bot.send_message(user_id, text, reply_markup=get_cancel_button(), parse_mode='Markdown')
-    user_data[user_id]['status_message_id'] = status_message.message_id
+    await safe_edit_message(context, user_id, user_data[user_id]['status_message_id'], text, get_cancel_button())
 
 async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Shows help information."""
-    try:
-        await update.callback_query.message.delete()
-    except Exception:
-        pass
+    user_id = update.effective_user.id
 
     help_text = "📖 *কীভাবে ব্যবহার করবেন:*\n\n*অডিও মার্জ করতে:*\n1. \"অডিও মার্জ করুন\" বাটনে ক্লিক করুন।\n2. যতগুলো ইচ্ছে অডিও/ভয়েস পাঠান।\n3. \"সম্পন্ন করুন\" বাটনে ক্লিক করুন।\n\n*ভিডিও বানাতে:*\n1. \"ভিডিও বানান\" বাটনে ক্লিক করুন।\n2. একটি ছবি পাঠান।\n3. একটি অডিও/ভয়েস পাঠান।"
     
     keyboard = [[InlineKeyboardButton("🔙 মূল মেনু", callback_data="cancel")]]
-    await context.bot.send_message(
-        chat_id=update.effective_user.id,
-        text=help_text,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode='Markdown'
+    await safe_edit_message(
+        context, user_id, update.callback_query.message.message_id,
+        help_text, InlineKeyboardMarkup(keyboard)
     )
 
 async def cancel_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -284,7 +291,12 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     mode = user_data[user_id]['mode']
-    user_data[user_id]['user_messages'].append(update.message.message_id)
+    
+    # Delete user's media message immediately
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
 
     is_photo = bool(update.message.photo)
     is_audio_type = bool(update.message.audio or update.message.voice or (update.message.document and update.message.document.mime_type and update.message.document.mime_type.startswith('audio')))
@@ -405,16 +417,20 @@ async def merge_audios(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if merged_file and os.path.exists(merged_file):
             os.remove(merged_file)
         
-        user_data[user_id] = {'merged_file': output_path}
-        options_msg = await context.bot.send_message(
-            chat_id=user_id, text="এখন কি করবেন?", reply_markup=get_after_merge_options()
-        )
-        user_data[user_id]['status_message_id'] = options_msg.message_id
+        # Update the same message with options
+        text = "এখন কি করবেন?"
+        await safe_edit_message(context, user_id, status_id, text, get_after_merge_options())
+        
+        user_data[user_id] = {
+            'merged_file': output_path,
+            'status_message_id': status_id
+        }
         
     except Exception as e:
         logger.error(f"Error merging audio: {e}")
         await reset_user(update, context, send_new_menu=False)
-        await context.bot.send_message(chat_id=user_id, text="❌ অডিও মার্জ করতে সমস্যা হয়েছে। আবার চেষ্টা করুন।", reply_markup=get_main_menu())
+        msg = await context.bot.send_message(chat_id=user_id, text="❌ অডিও মার্জ করতে সমস্যা হয়েছে। আবার চেষ্টা করুন।", reply_markup=get_main_menu())
+        user_data[user_id] = {'status_message_id': msg.message_id}
 
 
 def parse_ffmpeg_time(time_str: str) -> float:
@@ -510,7 +526,13 @@ async def create_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     video=video_file,
                     caption="✅ আপনার ভিডিও তৈরি সম্পন্ন হয়েছে!"
                 )
-            await reset_user(update, context, send_new_menu=True)
+            
+            # Update the same message to main menu
+            welcome_text = "আপনার ভিডিও সফলভাবে তৈরি হয়েছে!\n\nনিচের বাটন থেকে আপনার কাজ বেছে নিন:"
+            await safe_edit_message(context, user_id, status_id, welcome_text, get_main_menu())
+            
+            await cleanup_user_files(user_id)
+            user_data[user_id] = {'status_message_id': status_id}
         else:
             stderr_output = (await process.stderr.read()).decode()
             logger.error(f"FFmpeg error (code {process.returncode}): {stderr_output}")
@@ -518,8 +540,10 @@ async def create_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.error(f"Error creating video: {e}")
-        await reset_user(update, context, send_new_menu=False)
-        await context.bot.send_message(chat_id=user_id, text="❌ ভিডিও বানাতে একটি সমস্যা হয়েছে। আবার চেষ্টা করুন।", reply_markup=get_main_menu())
+        await cleanup_user_files(user_id)
+        text = "❌ ভিডিও বানাতে একটি সমস্যা হয়েছে। আবার চেষ্টা করুন।"
+        await safe_edit_message(context, user_id, status_id, text, get_main_menu())
+        user_data[user_id] = {'status_message_id': status_id}
 
 
 # --- Main Bot Execution ---
