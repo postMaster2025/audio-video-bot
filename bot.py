@@ -1,7 +1,10 @@
 import os
 import logging
+import asyncio
+import re
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+from telegram.error import BadRequest
 from pydub import AudioSegment
 import subprocess
 
@@ -34,7 +37,7 @@ def get_cancel_button():
 def get_done_button():
     """Returns 'Done' and 'Cancel' buttons for merging."""
     keyboard = [
-        [InlineKeyboardButton("✅ মার্জ সম্পন্ন করুন", callback_data="done")],
+        [InlineKeyboardButton("✅ সম্পন্ন করুন", callback_data="done")],
         [InlineKeyboardButton("❌ বাতিল করুন", callback_data="cancel")]
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -48,51 +51,130 @@ def get_after_merge_options():
     ]
     return InlineKeyboardMarkup(keyboard)
 
+# --- Utility Functions ---
+
+def get_progress_bar(percentage):
+    """Generates a simple text-based progress bar."""
+    filled = int(percentage / 10)
+    empty = 10 - filled
+    return "█" * filled + "░" * empty
+
+async def safe_edit_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, text: str, reply_markup=None):
+    """Safely edits a message, catching common errors."""
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+        return True
+    except BadRequest as e:
+        if "Message is not modified" in str(e):
+            pass
+        else:
+            logger.warning(f"Could not edit message {message_id}: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Error editing message {message_id}: {e}")
+        return False
+
+async def cleanup_user_files(user_id):
+    """Cleans up all temporary files for a given user."""
+    if user_id not in user_data:
+        return
+
+    data = user_data[user_id]
+    files_to_clean = (
+        data.get('audio_files', []) +
+        data.get('new_audio_files', []) +
+        [data.get(key) for key in ['merged_file', 'image', 'audio', 'output_video']]
+    )
+
+    for file_path in files_to_clean:
+        if file_path and os.path.exists(file_path):
+            try:
+                os.remove(file_path)
+                logger.info(f"Deleted file: {file_path}")
+            except OSError as e:
+                logger.error(f"Error removing file {file_path}: {e}")
+
+async def cleanup_user_messages(context: ContextTypes.DEFAULT_TYPE, user_id):
+    """Cleans up all temporary messages for a given user."""
+    if user_id not in user_data:
+        return
+    
+    data = user_data[user_id]
+    messages_to_delete = data.get('user_messages', [])
+    if 'status_message_id' in data:
+        messages_to_delete.append(data['status_message_id'])
+
+    for msg_id in messages_to_delete:
+        try:
+            await context.bot.delete_message(chat_id=user_id, message_id=msg_id)
+        except Exception:
+            pass
+
+async def reset_user(update: Update, context: ContextTypes.DEFAULT_TYPE, send_new_menu=True):
+    """Cleans up user data and shows the main menu."""
+    user_id = update.effective_user.id
+    
+    await cleanup_user_files(user_id)
+    await cleanup_user_messages(context, user_id)
+
+    if user_id in user_data:
+        del user_data[user_id]
+        
+    if send_new_menu:
+        welcome_text = "আপনার আগের সেশন বাতিল করা হয়েছে।\n\nনিচের বাটন থেকে আপনার কাজ বেছে নিন:"
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=welcome_text,
+            reply_markup=get_main_menu(),
+            parse_mode='Markdown'
+        )
+
 # --- Command and Action Handlers ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles the /start command and returns user to the main menu."""
+    """Handles the /start command."""
     user_id = update.effective_user.id
+    await cleanup_user_files(user_id)
     
-    # Reset user data
     if user_id in user_data:
-        del user_data[user_id]
-    
-    welcome_text = """
-🎵 *অডিও ভিডিও বট এ স্বাগতম!* 🎬
+        await cleanup_user_messages(context, user_id)
+        if user_id in user_data:
+            del user_data[user_id]
 
-আমি যা করতে পারি:
-━━━━━━━━━━━━━━━
-🎵 একাধিক অডিও একসাথে জোড়া লাগাতে পারি
-🎬 অডিও + ছবি দিয়ে ভিডিও বানাতে পারি
-
-নিচের বাটন থেকে আপনার কাজ বেছে নিন:
-"""
+    welcome_text = "🎵 *অডিও ভিডিও বট এ স্বাগতম!* 🎬\n\nআমি যা করতে পারি:\n━━━━━━━━━━━━━━━\n🎵 একাধিক অডিও একসাথে জোড়া লাগাতে পারি\n🎬 অডিও + ছবি দিয়ে ভিডিও বানাতে পারি\n\nনিচের বাটন থেকে আপনার কাজ বেছে নিন:"
     
     if update.message:
-        message = await update.message.reply_text(
+        await update.message.reply_text(
             welcome_text,
             reply_markup=get_main_menu(),
             parse_mode='Markdown'
         )
-        # Store message ID for later updates
-        user_data[user_id] = {'main_message_id': message.message_id}
     elif update.callback_query:
-        await update.callback_query.edit_message_text(
+        await update.callback_query.answer()
+        await update.callback_query.message.reply_text(
             welcome_text,
             reply_markup=get_main_menu(),
             parse_mode='Markdown'
         )
+        try:
+            await update.callback_query.message.delete()
+        except Exception:
+            pass
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles all button clicks and routes them to the correct function."""
+    """Handles all button clicks."""
     query = update.callback_query
     await query.answer()
     
     user_id = update.effective_user.id
     action = query.data
     
-    # Initialize user data if it doesn't exist
     if user_id not in user_data:
         user_data[user_id] = {}
     
@@ -114,271 +196,122 @@ async def start_merge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Starts the audio merging process."""
     user_id = update.effective_user.id
     
+    try:
+        await update.callback_query.message.delete()
+    except Exception:
+        pass
+
     user_data[user_id] = {
         'mode': 'merge',
         'audio_files': [],
         'audio_names': [],
-        'main_message_id': update.callback_query.message.message_id,
         'user_messages': []
     }
     
-    text = """
-🎵 *অডিও মার্জ মোড চালু হয়েছে!*
-
-━━━━━━━━━━━━━━━
-📝 এখন যতগুলো ইচ্ছে অডিও/ভয়েস পাঠান
-(Music অথবা File - দুইভাবেই পাঠাতে পারবেন)
-
-✅ যোগ করা অডিও: 0টি
-
-শেষ হলে "✅ মার্জ সম্পন্ন করুন" বাটন ক্লিক করুন
-"""
-    
-    await update.callback_query.edit_message_text(
-        text,
-        reply_markup=get_done_button(),
-        parse_mode='Markdown'
-    )
+    text = "🎵 *অডিও মার্জ মোড*\n\nএখন যতগুলো ইচ্ছে অডিও/ভয়েস পাঠান। শেষ হলে \"সম্পন্ন করুন\" বাটনে ক্লিক করুন।"
+    status_message = await context.bot.send_message(user_id, text, reply_markup=get_done_button(), parse_mode='Markdown')
+    user_data[user_id]['status_message_id'] = status_message.message_id
 
 async def add_more_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Allows adding more audio to a previously merged file."""
+    """Adds more audio to an existing merged file."""
     user_id = update.effective_user.id
-    
     if 'merged_file' not in user_data.get(user_id, {}):
-         await update.callback_query.answer("❌ প্রথমে একটি অডিও মার্জ করুন!", show_alert=True)
-         return
+        await update.callback_query.answer("❌ প্রথমে একটি অডিও মার্জ করুন!", show_alert=True)
+        return
+    
+    try:
+        await update.callback_query.message.delete()
+    except Exception:
+        pass
 
     user_data[user_id].update({
         'mode': 'add_more',
         'new_audio_files': [],
         'new_audio_names': [],
-        'main_message_id': update.callback_query.message.message_id,
         'user_messages': []
     })
     
-    text = """
-➕ *আরো অডিও যোগ করুন!*
-
-━━━━━━━━━━━━━━━
-📝 নতুন অডিও/ভয়েস পাঠান
-(পূর্বের মার্জ করা অডিওর সাথে যুক্ত হবে)
-
-✅ নতুন অডিও: 0টি
-
-শেষ হলে "✅ মার্জ সম্পন্ন করুন" বাটন ক্লিক করুন
-"""
-    
-    await update.callback_query.edit_message_text(
-        text,
-        reply_markup=get_done_button(),
-        parse_mode='Markdown'
-    )
+    text = "➕ *আরো অডিও যোগ করুন*\n\nনতুন অডিও/ভয়েস পাঠান। শেষ হলে \"সম্পন্ন করুন\" ক্লিক করুন।"
+    status_message = await context.bot.send_message(user_id, text, reply_markup=get_done_button(), parse_mode='Markdown')
+    user_data[user_id]['status_message_id'] = status_message.message_id
 
 async def start_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Starts the video creation process."""
     user_id = update.effective_user.id
-    
+    try:
+        await update.callback_query.message.delete()
+    except Exception:
+        pass
+
     user_data[user_id] = {
         'mode': 'video',
         'image': None,
-        'image_name': None,
         'audio': None,
-        'audio_name': None,
-        'main_message_id': update.callback_query.message.message_id,
         'user_messages': []
     }
     
-    text = """
-🎬 *ভিডিও বানানোর মোড চালু হয়েছে!*
-
-━━━━━━━━━━━━━━━
-📸 প্রথমে একটা ছবি পাঠান
-
-✅ ছবি: ❌
-✅ অডিও: ❌
-"""
-    
-    await update.callback_query.edit_message_text(
-        text,
-        reply_markup=get_cancel_button(),
-        parse_mode='Markdown'
-    )
+    text = "🎬 *ভিডিও বানানোর মোড*\n\n📸 প্রথমে একটি ছবি পাঠান।\n\n✅ ছবি: ❌\n✅ অডিও: ❌"
+    status_message = await context.bot.send_message(user_id, text, reply_markup=get_cancel_button(), parse_mode='Markdown')
+    user_data[user_id]['status_message_id'] = status_message.message_id
 
 async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Displays the help message."""
-    help_text = """
-📖 *কীভাবে ব্যবহার করবেন:*
+    """Shows help information."""
+    try:
+        await update.callback_query.message.delete()
+    except Exception:
+        pass
 
-━━━━━━━━━━━━━━━
-🎵 *অডিও মার্জ করতে:*
-1. "অডিও মার্জ করুন" বাটনে ক্লিক করুন
-2. যতগুলো ইচ্ছে অডিও/ভয়েস পাঠান
-   (Music বা File - যেকোনোভাবে)
-3. "মার্জ সম্পন্ন করুন" বাটনে ক্লিক করুন
-4. মার্জের পর আরো অডিও যোগ করতে পারবেন!
-
-🎬 *ভিডিও বানাতে:*
-1. "ভিডিও বানান" বাটনে ক্লিক করুন
-2. একটা ছবি পাঠান
-3. একটা অডিও/ভয়েস পাঠান
-4. আমি ভিডিও বানিয়ে দিবো!
-
-━━━━━━━━━━━━━━━
-💡 সব মেসেজ অটোমেটিক ডিলিট হয়ে যাবে
-💡 শুধু ফাইনাল আউটপুট থাকবে
-"""
+    help_text = "📖 *কীভাবে ব্যবহার করবেন:*\n\n*অডিও মার্জ করতে:*\n1. \"অডিও মার্জ করুন\" বাটনে ক্লিক করুন।\n2. যতগুলো ইচ্ছে অডিও/ভয়েস পাঠান।\n3. \"সম্পন্ন করুন\" বাটনে ক্লিক করুন।\n\n*ভিডিও বানাতে:*\n1. \"ভিডিও বানান\" বাটনে ক্লিক করুন।\n2. একটি ছবি পাঠান।\n3. একটি অডিও/ভয়েস পাঠান।"
     
     keyboard = [[InlineKeyboardButton("🔙 মূল মেনু", callback_data="cancel")]]
-    
-    await update.callback_query.edit_message_text(
-        help_text,
+    await context.bot.send_message(
+        chat_id=update.effective_user.id,
+        text=help_text,
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode='Markdown'
     )
 
 async def cancel_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cancels the current operation and cleans up files."""
-    user_id = update.effective_user.id
-    
-    # Delete user's messages
-    if user_id in user_data and 'user_messages' in user_data[user_id]:
-        for msg_id in user_data[user_id]['user_messages']:
-            try:
-                await context.bot.delete_message(chat_id=user_id, message_id=msg_id)
-            except Exception:
-                pass
-    
-    # Clean up all temporary files associated with the user
-    if user_id in user_data:
-        files_to_clean = [
-            user_data[user_id].get('audio_files', []),
-            user_data[user_id].get('new_audio_files', []),
-            [user_data[user_id].get('merged_file')],
-            [user_data[user_id].get('image')],
-            [user_data[user_id].get('audio')]
-        ]
-        for file_list in files_to_clean:
-            for file_path in file_list:
-                if file_path and os.path.exists(file_path):
-                    os.remove(file_path)
-    
-    await start(update, context)
+    """Cancels the current operation."""
+    await reset_user(update, context, send_new_menu=True)
 
 # --- Media Handlers ---
 
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles files sent as documents."""
+async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Routes media to appropriate handlers based on mode."""
     user_id = update.effective_user.id
-    
-    if user_id not in user_data: user_data[user_id] = {}
-    if 'user_messages' not in user_data[user_id]: user_data[user_id]['user_messages'] = []
+    if user_id not in user_data or 'mode' not in user_data.get(user_id, {}):
+        return
+
+    mode = user_data[user_id]['mode']
     user_data[user_id]['user_messages'].append(update.message.message_id)
-    
-    document = update.message.document
-    mime_type = document.mime_type or ""
-    file_name = document.file_name or ""
-    
-    audio_extensions = ['.mp3', '.wav', '.ogg', '.m4a', '.aac', '.flac', '.wma']
-    audio_mimes = ['audio/', 'application/ogg']
-    
-    is_audio = any(file_name.lower().endswith(ext) for ext in audio_extensions) or \
-               any(mime in mime_type for mime in audio_mimes)
-    
-    if not is_audio:
-        msg = await update.message.reply_text("❌ শুধুমাত্র অডিও ফাইল পাঠান!")
-        user_data[user_id]['user_messages'].append(msg.message_id)
-        return
 
-    mode = user_data.get(user_id, {}).get('mode')
-    if not mode:
-        msg = await update.message.reply_text("প্রথমে মূল মেনু থেকে একটা অপশন বেছে নিন। /start চাপুন।")
-        user_data[user_id]['user_messages'].append(msg.message_id)
-        return
-    
-    if mode == 'merge': await handle_merge_document(update, context)
-    elif mode == 'add_more': await handle_add_more_document(update, context)
-    elif mode == 'video': await handle_video_document(update, context)
+    is_photo = bool(update.message.photo)
+    is_audio_type = bool(update.message.audio or update.message.voice or (update.message.document and update.message.document.mime_type and update.message.document.mime_type.startswith('audio')))
 
-async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles audio files."""
-    user_id = update.effective_user.id
+    if mode == 'video':
+        if is_photo and not user_data[user_id].get('image'):
+            await handle_photo(update, context)
+        elif is_audio_type and user_data[user_id].get('image'):
+            await process_video_audio(update, context)
+    elif mode in ['merge', 'add_more'] and is_audio_type:
+        await process_incoming_audio(update, context)
 
-    if user_id not in user_data: user_data[user_id] = {}
-    if 'user_messages' not in user_data[user_id]: user_data[user_id]['user_messages'] = []
-    user_data[user_id]['user_messages'].append(update.message.message_id)
-    
-    mode = user_data.get(user_id, {}).get('mode')
-    if not mode:
-        msg = await update.message.reply_text("প্রথমে মূল মেনু থেকে একটা অপশন বেছে নিন। /start চাপুন।")
-        user_data[user_id]['user_messages'].append(msg.message_id)
-        return
-        
-    if mode == 'merge': await handle_merge_audio(update, context)
-    elif mode == 'add_more': await handle_add_more_audio(update, context)
-    elif mode == 'video': await handle_video_audio(update, context)
-
-async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles voice messages."""
-    user_id = update.effective_user.id
-    
-    if user_id not in user_data: user_data[user_id] = {}
-    if 'user_messages' not in user_data[user_id]: user_data[user_id]['user_messages'] = []
-    user_data[user_id]['user_messages'].append(update.message.message_id)
-    
-    mode = user_data.get(user_id, {}).get('mode')
-    if not mode:
-        msg = await update.message.reply_text("প্রথমে মূল মেনু থেকে একটা অপশন বেছে নিন। /start চাপুন।")
-        user_data[user_id]['user_messages'].append(msg.message_id)
-        return
-    
-    if mode == 'merge': await handle_merge_voice(update, context)
-    elif mode == 'add_more': await handle_add_more_voice(update, context)
-    elif mode == 'video': await handle_video_voice(update, context)
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handles photos, specifically for video creation."""
+    """Handles photo upload for video creation."""
     user_id = update.effective_user.id
-    
-    if user_id not in user_data: user_data[user_id] = {}
-    if 'user_messages' not in user_data[user_id]: user_data[user_id]['user_messages'] = []
-    user_data[user_id]['user_messages'].append(update.message.message_id)
-    
-    if user_data.get(user_id, {}).get('mode') != 'video':
-        msg = await update.message.reply_text("প্রথমে 'ভিডিও বানান' বাটনে ক্লিক করুন। /start চাপুন।")
-        user_data[user_id]['user_messages'].append(msg.message_id)
-        return
-    
-    try:
-        photo_file = await update.message.photo[-1].get_file()
-        photo_path = f"image_{user_id}.jpg"
-        await photo_file.download_to_drive(photo_path)
-        
-        user_data[user_id]['image'] = photo_path
-        user_data[user_id]['image_name'] = "ছবি.jpg"
-        
-        text = f"""
-🎬 *ভিডিও বানানোর মোড চালু হয়েছে!*
+    photo_file = await update.message.photo[-1].get_file()
+    photo_path = f"image_{user_id}.jpg"
+    await photo_file.download_to_drive(photo_path)
+    user_data[user_id]['image'] = photo_path
 
-━━━━━━━━━━━━━━━
-✅ ছবি: {user_data[user_id]['image_name']}
-❌ অডিও: এখনো পাঠাননি
+    text = "🎬 *ভিডিও বানানোর মোড*\n\n🎵 এখন একটি অডিও বা ভয়েস পাঠান।\n\n✅ ছবি: ✔️ (সংযুক্ত)\n✅ অডিও: ❌"
+    await safe_edit_message(context, user_id, user_data[user_id]['status_message_id'], text, get_cancel_button())
 
-এখন একটা অডিও বা ভয়েস পাঠান
-"""
-        await context.bot.edit_message_text(
-            chat_id=user_id,
-            message_id=user_data[user_id]['main_message_id'],
-            text=text,
-            reply_markup=get_cancel_button(),
-            parse_mode='Markdown'
-        )
-    except Exception as e:
-        logger.error(f"Error handling photo: {e}")
 
-# --- File Processing Logic ---
-
-async def process_incoming_audio(update, context, audio_type):
-    """Generic function to process and save audio/voice/document files."""
+async def process_incoming_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Processes incoming audio files for merging."""
     user_id = update.effective_user.id
     mode = user_data[user_id]['mode']
     is_add_more = (mode == 'add_more')
@@ -386,359 +319,224 @@ async def process_incoming_audio(update, context, audio_type):
     file_list_key = 'new_audio_files' if is_add_more else 'audio_files'
     name_list_key = 'new_audio_names' if is_add_more else 'audio_names'
     
-    file_prefix = "add_" if is_add_more else ""
+    file_obj = update.message.audio or update.message.voice or update.message.document
+    file_handle = await file_obj.get_file()
+    file_path = f"audio_{user_id}_{len(user_data[user_id][file_list_key])}"
+    await file_handle.download_to_drive(file_path)
+
+    file_name = getattr(file_obj, 'file_name', f"Audio {len(user_data[user_id][file_list_key]) + 1}")
+        
+    user_data[user_id][file_list_key].append(file_path)
+    user_data[user_id][name_list_key].append(file_name)
     
-    try:
-        if audio_type == 'audio':
-            file_obj = update.message.audio
-            file_ext = ".mp3"
-            default_name = f"অডিও_{len(user_data[user_id][file_list_key]) + 1}{file_ext}"
-            file_name = file_obj.file_name or default_name
-        elif audio_type == 'voice':
-            file_obj = update.message.voice
-            file_ext = ".ogg"
-            file_name = f"ভয়েস_{len(user_data[user_id][file_list_key]) + 1}{file_ext}"
-        elif audio_type == 'document':
-            file_obj = update.message.document
-            file_ext = ""
-            default_name = f"audio_{len(user_data[user_id][file_list_key]) + 1}"
-            file_name = file_obj.file_name or default_name
-        
-        file_handle = await file_obj.get_file()
-        file_path = f"{file_prefix}{audio_type}_{user_id}_{len(user_data[user_id][file_list_key])}{file_ext}"
-        await file_handle.download_to_drive(file_path)
-        
-        user_data[user_id][file_list_key].append(file_path)
-        user_data[user_id][name_list_key].append(file_name)
-        
-        audio_count = len(user_data[user_id][file_list_key])
-        audio_list = "\n".join([f"  {i+1}. {name}" for i, name in enumerate(user_data[user_id][name_list_key])])
-        
-        if is_add_more:
-            text = f"""
-➕ *আরো অডিও যোগ করুন!*
-━━━━━━━━━━━━━━━
-✅ নতুন অডিও: {audio_count}টি
-{audio_list}
-আরো পাঠান অথবা "✅ মার্জ সম্পন্ন করুন" বাটন ক্লিক করুন
-"""
-        else:
-            text = f"""
-🎵 *অডিও মার্জ মোড চালু হয়েছে!*
-━━━━━━━━━━━━━━━
-✅ যোগ করা অডিও: {audio_count}টি
-{audio_list}
-আরো অডিও পাঠান অথবা "✅ মার্জ সম্পন্ন করুন" বাটন ক্লিক করুন
-"""
-        await context.bot.edit_message_text(
-            chat_id=user_id,
-            message_id=user_data[user_id]['main_message_id'],
-            text=text,
-            reply_markup=get_done_button(),
-            parse_mode='Markdown'
-        )
-    except Exception as e:
-        logger.error(f"Error processing incoming {audio_type}: {e}")
+    audio_count = len(user_data[user_id][file_list_key])
+    audio_list = "\n".join([f"  `{i+1}. {name}`" for i, name in enumerate(user_data[user_id][name_list_key])])
+    
+    text = f"🎵 *অডিও মার্জ মোড*\n\n*যোগ করা অডিও: {audio_count}টি*\n{audio_list}\n\nআরো অডিও পাঠান অথবা \"সম্পন্ন করুন\" ক্লিক করুন।"
+    await safe_edit_message(context, user_id, user_data[user_id]['status_message_id'], text, get_done_button())
 
-# Simplified handlers calling the generic processor
-async def handle_merge_audio(update, context): await process_incoming_audio(update, context, 'audio')
-async def handle_merge_document(update, context): await process_incoming_audio(update, context, 'document')
-async def handle_merge_voice(update, context): await process_incoming_audio(update, context, 'voice')
-async def handle_add_more_audio(update, context): await process_incoming_audio(update, context, 'audio')
-async def handle_add_more_document(update, context): await process_incoming_audio(update, context, 'document')
-async def handle_add_more_voice(update, context): await process_incoming_audio(update, context, 'voice')
 
-async def process_video_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, audio_type: str):
-    """Generic function to handle audio for video creation."""
+async def process_video_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Processes audio for video creation."""
     user_id = update.effective_user.id
-    if user_data.get(user_id, {}).get('image') is None:
-        return
-
-    try:
-        if audio_type == 'audio':
-            file_obj = update.message.audio
-            file_ext = ".mp3"
-            default_name = "অডিও.mp3"
-            file_name = file_obj.file_name or default_name
-        elif audio_type == 'voice':
-            file_obj = update.message.voice
-            file_ext = ".ogg"
-            file_name = "ভয়েস.ogg"
-        elif audio_type == 'document':
-            file_obj = update.message.document
-            file_ext = ""
-            file_name = file_obj.file_name or "audio.mp3"
-
-        file_handle = await file_obj.get_file()
-        audio_path = f"video_{audio_type}_{user_id}{file_ext}"
-        await file_handle.download_to_drive(audio_path)
-        
-        user_data[user_id]['audio'] = audio_path
-        user_data[user_id]['audio_name'] = file_name
-        
-        await create_video(update, context)
-    except Exception as e:
-        logger.error(f"Error handling video {audio_type}: {e}")
-
-# Simplified handlers for video audio
-async def handle_video_audio(update, context): await process_video_audio(update, context, 'audio')
-async def handle_video_document(update, context): await process_video_audio(update, context, 'document')
-async def handle_video_voice(update, context): await process_video_audio(update, context, 'voice')
+    file_obj = update.message.audio or update.message.voice or update.message.document
+    file_handle = await file_obj.get_file()
+    audio_path = f"video_audio_{user_id}"
+    await file_handle.download_to_drive(audio_path)
+    user_data[user_id]['audio'] = audio_path
+    
+    text = "🎬 *ভিডিও বানানোর মোড*\n\nসব ফাইল পাওয়া গেছে! ভিডিও তৈরি করা হচ্ছে...\n\n✅ ছবি: ✔️\n✅ অডিও: ✔️"
+    await safe_edit_message(context, user_id, user_data[user_id]['status_message_id'], text)
+    await create_video(update, context)
 
 # --- Core Logic: Merge and Create ---
 
-def get_progress_bar(percentage):
-    """Generates a simple text-based progress bar."""
-    filled = int(percentage / 10)
-    empty = 10 - filled
-    return "▓" * filled + "░" * empty
-
 async def merge_audios(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Main function to merge audio files."""
+    """Merges multiple audio files into one."""
     user_id = update.effective_user.id
-    mode = user_data[user_id]['mode']
+    mode = user_data[user_id].get('mode')
     
-    if mode == 'add_more':
-        if len(user_data[user_id].get('new_audio_files', [])) < 1:
-            await update.callback_query.answer("❌ কমপক্ষে ১টা নতুন অডিও পাঠান!", show_alert=True)
-            return
-        await merge_with_previous(update, context)
+    is_add_more = (mode == 'add_more')
+    base_files = [user_data[user_id]['merged_file']] if is_add_more else []
+    new_files = user_data[user_id].get('new_audio_files' if is_add_more else 'audio_files', [])
+
+    if not new_files or (not is_add_more and len(new_files) < 2):
+        await update.callback_query.answer("❌ কমপক্ষে " + ("১টি নতুন" if is_add_more else "২টি") + " অডিও পাঠান!", show_alert=True)
         return
-    
-    if len(user_data[user_id].get('audio_files', [])) < 2:
-        await update.callback_query.answer("❌ কমপক্ষে ২টা অডিও পাঠান!", show_alert=True)
-        return
-    
+
     await update.callback_query.answer()
-    main_msg_id = user_data[user_id]['main_message_id']
-    
+    status_id = user_data[user_id]['status_message_id']
+    all_files = base_files + new_files
+    total_files = len(all_files)
+
     try:
-        await context.bot.edit_message_text(
-            chat_id=user_id, message_id=main_msg_id,
-            text=f"⏳ *অডিও মার্জ করা হচ্ছে...*\n\n{get_progress_bar(10)} 10%\n\n📂 অডিও ফাইল লোড করা হচ্ছে...",
-            parse_mode='Markdown'
-        )
-        
         combined = AudioSegment.empty()
-        audio_files = user_data[user_id]['audio_files']
-        total_files = len(audio_files)
-        
-        for idx, audio_path in enumerate(audio_files):
+        # 1. Loading Phase (0% -> 80%)
+        for idx, audio_path in enumerate(all_files):
+            progress = int(((idx + 1) / total_files) * 80)
+            text = f"⏳ *অডিও মার্জ হচ্ছে...*\n\n{get_progress_bar(progress)} {progress}%\n\n*ধাপ ১/২:* অডিও ফাইল লোড করা হচ্ছে ({idx + 1}/{total_files})..."
+            await safe_edit_message(context, user_id, status_id, text)
             audio = AudioSegment.from_file(audio_path)
             combined += audio
-            progress = 30 + int((idx + 1) / total_files * 40)
-            await context.bot.edit_message_text(
-                chat_id=user_id, message_id=main_msg_id,
-                text=f"⏳ *অডিও মার্জ করা হচ্ছে...*\n\n{get_progress_bar(progress)} {progress}%\n\n🔗 অডিও একত্রিত করা হচ্ছে... ({idx + 1}/{total_files})",
-                parse_mode='Markdown'
-            )
         
-        await context.bot.edit_message_text(
-            chat_id=user_id, message_id=main_msg_id,
-            text=f"⏳ *অডিও মার্জ করা হচ্ছে...*\n\n{get_progress_bar(80)} 80%\n\n💾 ফাইল সংরক্ষণ করা হচ্ছে...",
-            parse_mode='Markdown'
-        )
+        # 2. Exporting Phase (80% -> 100%)
+        progress = 90
+        text = f"⏳ *অডিও মার্জ হচ্ছে...*\n\n{get_progress_bar(progress)} {progress}%\n\n*ধাপ ২/২:* সব অডিও একত্রিত করে সংরক্ষণ করা হচ্ছে..."
+        await safe_edit_message(context, user_id, status_id, text)
         
         output_path = f"merged_{user_id}.mp3"
         combined.export(output_path, format="mp3")
         
-        await context.bot.edit_message_text(
-            chat_id=user_id, message_id=main_msg_id,
-            text=f"⏳ *অডিও মার্জ করা হচ্ছে...*\n\n{get_progress_bar(100)} 100%\n\n✅ সম্পন্ন হয়েছে!",
-            parse_mode='Markdown'
-        )
+        progress = 100
+        text = f"✅ *মার্জ সম্পন্ন!*\n\n{get_progress_bar(progress)} {progress}%\n\nএখন আপনাকে ফাইলটি পাঠানো হচ্ছে..."
+        await safe_edit_message(context, user_id, status_id, text)
         
-        # Cleanup messages
-        for msg_id in user_data[user_id]['user_messages']:
-            try: await context.bot.delete_message(chat_id=user_id, message_id=msg_id)
-            except Exception: pass
-        try: await context.bot.delete_message(chat_id=user_id, message_id=main_msg_id)
-        except Exception: pass
+        await asyncio.sleep(0.5)
         
-        # Send result
         with open(output_path, 'rb') as audio_file:
             await context.bot.send_audio(
                 chat_id=user_id, audio=audio_file, title="Merged Audio",
-                caption=f"✅ {total_files} টি অডিও একসাথে জোড়া লাগানো হয়েছে!\n\nআরো অডিও যোগ করতে চান?"
+                caption=f"✅ {len(new_files)} টি অডিও সফলভাবে মার্জ হয়েছে!"
             )
         
+        await cleanup_user_messages(context, user_id)
+        
+        merged_file = user_data[user_id].get('merged_file')
+        if merged_file and os.path.exists(merged_file):
+            os.remove(merged_file)
+        
+        user_data[user_id] = {'merged_file': output_path}
         options_msg = await context.bot.send_message(
             chat_id=user_id, text="এখন কি করবেন?", reply_markup=get_after_merge_options()
         )
-        
-        # Cleanup files and update user data for next step
-        for audio_path in audio_files:
-            if os.path.exists(audio_path): os.remove(audio_path)
-        
-        user_data[user_id] = {
-            'main_message_id': options_msg.message_id,
-            'merged_file': output_path
-        }
+        user_data[user_id]['status_message_id'] = options_msg.message_id
         
     except Exception as e:
         logger.error(f"Error merging audio: {e}")
-        await context.bot.send_message(chat_id=user_id, text="❌ অডিও মার্জ করতে সমস্যা হয়েছে। আবার চেষ্টা করুন।")
+        await reset_user(update, context, send_new_menu=False)
+        await context.bot.send_message(chat_id=user_id, text="❌ অডিও মার্জ করতে সমস্যা হয়েছে। আবার চেষ্টা করুন।", reply_markup=get_main_menu())
 
-async def merge_with_previous(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Merges new audio files with a previously merged one."""
-    user_id = update.effective_user.id
-    await update.callback_query.answer()
-    main_msg_id = user_data[user_id]['main_message_id']
-    
+
+def parse_ffmpeg_time(time_str: str) -> float:
+    """Converts FFmpeg time format HH:MM:SS.ss to seconds."""
     try:
-        await context.bot.edit_message_text(
-            chat_id=user_id, message_id=main_msg_id,
-            text=f"⏳ *অডিও মার্জ করা হচ্ছে...*\n\n{get_progress_bar(10)} 10%\n\n📂 পূর্বের ফাইল লোড করা হচ্ছে...",
-            parse_mode='Markdown'
-        )
-        
-        combined = AudioSegment.from_file(user_data[user_id]['merged_file'])
-        new_audio_files = user_data[user_id]['new_audio_files']
-        total_files = len(new_audio_files)
-
-        for idx, audio_path in enumerate(new_audio_files):
-            audio = AudioSegment.from_file(audio_path)
-            combined += audio
-            progress = 30 + int((idx + 1) / total_files * 40)
-            await context.bot.edit_message_text(
-                chat_id=user_id, message_id=main_msg_id,
-                text=f"⏳ *অডিও মার্জ করা হচ্ছে...*\n\n{get_progress_bar(progress)} {progress}%\n\n🔗 নতুন অডিও যোগ করা হচ্ছে... ({idx + 1}/{total_files})",
-                parse_mode='Markdown'
-            )
-        
-        await context.bot.edit_message_text(
-            chat_id=user_id, message_id=main_msg_id,
-            text=f"⏳ *অডিও মার্জ করা হচ্ছে...*\n\n{get_progress_bar(80)} 80%\n\n💾 ফাইল সংরক্ষণ করা হচ্ছে...",
-            parse_mode='Markdown'
-        )
-        
-        output_path = f"merged_{user_id}_new.mp3"
-        combined.export(output_path, format="mp3")
-        
-        await context.bot.edit_message_text(
-            chat_id=user_id, message_id=main_msg_id,
-            text=f"⏳ *অডিও মার্জ করা হচ্ছে...*\n\n{get_progress_bar(100)} 100%\n\n✅ সম্পন্ন হয়েছে!",
-            parse_mode='Markdown'
-        )
-        
-        # Cleanup messages
-        for msg_id in user_data[user_id].get('user_messages', []):
-            try: await context.bot.delete_message(chat_id=user_id, message_id=msg_id)
-            except Exception: pass
-        try: await context.bot.delete_message(chat_id=user_id, message_id=main_msg_id)
-        except Exception: pass
-        
-        # Send result
-        with open(output_path, 'rb') as audio_file:
-            await context.bot.send_audio(
-                chat_id=user_id, audio=audio_file, title="Updated Merged Audio",
-                caption=f"✅ আপডেট সম্পন্ন! {total_files} টি নতুন অডিও যোগ হয়েছে!"
-            )
-        
-        options_msg = await context.bot.send_message(
-            chat_id=user_id, text="এখন কি করবেন?", reply_markup=get_after_merge_options()
-        )
-        
-        # Cleanup old files
-        for audio_path in new_audio_files:
-            if os.path.exists(audio_path): os.remove(audio_path)
-        if os.path.exists(user_data[user_id]['merged_file']):
-            os.remove(user_data[user_id]['merged_file'])
-        
-        # Update user data for next step
-        user_data[user_id] = {
-            'main_message_id': options_msg.message_id,
-            'merged_file': output_path
-        }
-        
+        parts = time_str.split(':')
+        hours = int(parts[0])
+        minutes = int(parts[1])
+        seconds = float(parts[2])
+        return hours * 3600 + minutes * 60 + seconds
     except Exception as e:
-        logger.error(f"Error merging with previous: {e}")
-        await context.bot.send_message(chat_id=user_id, text="❌ অডিও মার্জ করতে সমস্যা হয়েছে। আবার চেষ্টা করুন।")
+        logger.error(f"Error parsing time {time_str}: {e}")
+        return 0.0
 
 async def create_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Creates a video from an image and an audio file using FFmpeg."""
+    """Creates a video from an image and audio with real-time progress."""
     user_id = update.effective_user.id
-    main_msg_id = user_data[user_id]['main_message_id']
-    
-    await context.bot.edit_message_text(
-        chat_id=user_id, message_id=main_msg_id,
-        text="⏳ ভিডিও বানানো হচ্ছে... অপেক্ষা করুন...",
-        parse_mode='Markdown'
-    )
+    status_id = user_data[user_id]['status_message_id']
     
     try:
         image_path = user_data[user_id]['image']
         audio_path = user_data[user_id]['audio']
         output_video = f"video_{user_id}.mp4"
+        user_data[user_id]['output_video'] = output_video
         
-        audio_segment = AudioSegment.from_file(audio_path)
-        duration = len(audio_segment) / 1000.0
+        try:
+            audio_duration = len(AudioSegment.from_file(audio_path)) / 1000.0
+            logger.info(f"Audio duration: {audio_duration}s")
+        except Exception as e:
+            logger.error(f"Cannot read audio duration: {e}")
+            audio_duration = 0
         
         cmd = [
             'ffmpeg', '-loop', '1', '-i', image_path, '-i', audio_path,
-            '-c:v', 'libx264', '-tune', 'stillimage', '-c:a', 'aac',
-            '-b:a', '192k', '-pix_fmt', 'yuv420p', '-shortest', '-t', str(duration),
-            '-y', output_video
+            '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23', 
+            '-c:a', 'aac', '-b:a', '192k', '-pix_fmt', 'yuv420p', 
+            '-shortest', '-y', output_video, '-progress', 'pipe:1', '-loglevel', 'error'
         ]
         
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-        
-        # Cleanup messages
-        for msg_id in user_data[user_id]['user_messages']:
-            try:
-                await context.bot.delete_message(chat_id=user_id, message_id=msg_id)
-            except Exception:
-                pass
-        try:
-            await context.bot.delete_message(chat_id=user_id, message_id=main_msg_id)
-        except Exception:
-            pass
-        
-        # Send video
-        with open(output_video, 'rb') as video_file:
-            await context.bot.send_video(
-                chat_id=user_id,
-                video=video_file,
-                caption="✅ ভিডিও তৈরি সম্পন্ন হয়েছে!"
-            )
-        
-        # Cleanup temporary files
-        if os.path.exists(image_path): os.remove(image_path)
-        if os.path.exists(audio_path): os.remove(audio_path)
-        if os.path.exists(output_video): os.remove(output_video)
-        
-        # Reset to main menu
-        welcome_text = "আপনার কাজ সম্পন্ন হয়েছে! নতুন করে শুরু করতে পারেন।"
-        menu_msg = await context.bot.send_message(
-            chat_id=user_id, text=welcome_text,
-            reply_markup=get_main_menu(), parse_mode='Markdown'
+        process = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
-        user_data[user_id] = {'main_message_id': menu_msg.message_id}
         
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Error creating video with FFmpeg: {e.stderr}")
-        await context.bot.send_message(chat_id=user_id, text="❌ ভিডিও বানাতে সমস্যা হয়েছে। অডিও বা ছবির ফরম্যাট চেক করুন।")
+        last_reported_progress = -1
+        
+        while True:
+            line_bytes = await process.stdout.readline()
+            if not line_bytes:
+                break
+            
+            line = line_bytes.decode('utf-8', errors='ignore').strip()
+            
+            if line.startswith('out_time_ms='):
+                try:
+                    time_us = int(line.split('=')[1])
+                    current_time_sec = time_us / 1000000.0
+                    
+                    if audio_duration > 0:
+                        progress = min(99, int((current_time_sec / audio_duration) * 100))
+                        
+                        if progress > last_reported_progress and progress % 10 == 0:
+                            last_reported_progress = progress
+                            text = f"⏳ *ভিডিও তৈরি হচ্ছে...*\n\n{get_progress_bar(progress)} {progress}%\n\nদয়া করে অপেক্ষা করুন।"
+                            await safe_edit_message(context, user_id, status_id, text)
+                            await asyncio.sleep(0.3)
+                except (ValueError, IndexError) as e:
+                    logger.debug(f"Could not parse progress: {e}")
+            
+            elif 'time=' in line:
+                time_match = re.search(r"time=(\d{2}:\d{2}:\d{2}\.\d{2})", line)
+                if time_match:
+                    current_time_str = time_match.group(1)
+                    current_time_sec = parse_ffmpeg_time(current_time_str)
+                    
+                    if audio_duration > 0 and current_time_sec > 0:
+                        progress = min(99, int((current_time_sec / audio_duration) * 100))
+                        
+                        if progress > last_reported_progress and progress % 10 == 0:
+                            last_reported_progress = progress
+                            text = f"⏳ *ভিডিও তৈরি হচ্ছে...*\n\n{get_progress_bar(progress)} {progress}%\n\nদয়া করে অপেক্ষা করুন।"
+                            await safe_edit_message(context, user_id, status_id, text)
+                            await asyncio.sleep(0.3)
+
+        await process.wait()
+        
+        if process.returncode == 0:
+            text = f"✅ *ভিডিও তৈরি সম্পন্ন!*\n\n{get_progress_bar(100)} 100%\n\nএখন আপনাকে ভিডিওটি পাঠানো হচ্ছে..."
+            await safe_edit_message(context, user_id, status_id, text)
+            
+            with open(output_video, 'rb') as video_file:
+                await context.bot.send_video(
+                    chat_id=user_id,
+                    video=video_file,
+                    caption="✅ আপনার ভিডিও তৈরি সম্পন্ন হয়েছে!"
+                )
+            await reset_user(update, context, send_new_menu=True)
+        else:
+            stderr_output = (await process.stderr.read()).decode()
+            logger.error(f"FFmpeg error (code {process.returncode}): {stderr_output}")
+            raise Exception(f"FFmpeg failed with code {process.returncode}")
+
     except Exception as e:
         logger.error(f"Error creating video: {e}")
-        await context.bot.send_message(chat_id=user_id, text="❌ ভিডিও বানাতে একটি অপ্রত্যাশিত সমস্যা হয়েছে। আবার চেষ্টা করুন।")
+        await reset_user(update, context, send_new_menu=False)
+        await context.bot.send_message(chat_id=user_id, text="❌ ভিডিও বানাতে একটি সমস্যা হয়েছে। আবার চেষ্টা করুন।", reply_markup=get_main_menu())
 
 
 # --- Main Bot Execution ---
 
 def main():
-    """Starts the bot."""
+    """Main entry point for the bot."""
     if not TOKEN:
-        logger.error("BOT_TOKEN not found in environment variables!")
+        logger.error("BOT_TOKEN not found! Please set the BOT_TOKEN environment variable.")
         return
     
     application = Application.builder().token(TOKEN).build()
     
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(button_handler))
-    application.add_handler(MessageHandler(filters.AUDIO, handle_audio))
-    application.add_handler(MessageHandler(filters.VOICE, handle_voice))
-    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    
+    media_filters = filters.AUDIO | filters.VOICE | filters.PHOTO | filters.Document.ALL
+    application.add_handler(MessageHandler(media_filters, handle_media))
     
     logger.info("Bot is starting...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
