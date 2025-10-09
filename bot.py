@@ -120,7 +120,7 @@ async def cleanup_user_files(user_id):
 
 
 async def reset_user_on_error(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """More destructive reset for use in error handlers."""
+    """More destructive reset for use in error handlers. Sends a new message."""
     user_id = update.effective_user.id
     
     await cleanup_user_files(user_id)
@@ -223,7 +223,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "merge": start_merge,
         "video": start_video,
         "help": show_help,
-        "cancel": cancel_action, # *** এই ফাংশনটির আচরণ পরিবর্তন করা হয়েছে ***
+        "cancel": cancel_action, # *** এই ফাংশনটির সঠিক সংস্করণ এখন এখানে ***
         "done": merge_audios,
         "add_more": add_more_audio,
         "download_audio": download_audio,
@@ -272,7 +272,7 @@ async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton("🔙 মূল মেনু", callback_data="cancel")]]
     await safe_edit_message(context, user_id, update.callback_query.message.message_id, help_text, InlineKeyboardMarkup(keyboard))
 
-# *** পরিবর্তন: এই ফাংশনটি এখন মেসেজ ডিলিট না করে এডিট করে ***
+# *** চূড়ান্ত সমাধান: এই ফাংশনটি এখন মেসেজ ডিলিট না করে এডিট করে ***
 async def cancel_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancels the current operation by editing the message back to the main menu."""
     query = update.callback_query
@@ -402,7 +402,6 @@ async def merge_audios(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = f"⏳ *অডিও মার্জ হচ্ছে...*\n\n{get_progress_bar(progress)} {progress}%\n\n*ধাপ ২/২:* সব অডিও একত্রিত করে সংরক্ষণ করা হচ্ছে..."
         await safe_edit_message(context, user_id, status_id, text)
         output_path = f"merged_{user_id}_{datetime.now().timestamp()}.mp3"
-        # *** ফাইল সাইজ অপ্টিমাইজেশন: বিটরেট 128k করা হয়েছে ***
         combined.export(output_path, format="mp3", bitrate="128k")
         progress = 100
         text = f"✅ *মার্জ সম্পন্ন!*\n\n{get_progress_bar(progress)} {progress}%\n\nফাইল প্রস্তুত! ডাউনলোড করতে নিচের বাটনে ক্লিক করুন।"
@@ -481,7 +480,6 @@ async def create_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             audio_duration = 0
         
-        # *** ফাইল সাইজ অপ্টিমাইজেশন: FFmpeg কমান্ড পরিবর্তন করা হয়েছে ***
         cmd = [
             'ffmpeg', '-loop', '1', '-i', image_path, '-i', audio_path,
             '-c:v', 'libx264', '-preset', 'medium', '-crf', '30', 
