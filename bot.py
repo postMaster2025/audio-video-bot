@@ -497,7 +497,8 @@ async def merge_audios(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit_message(context, user_id, status_id, text)
         
         output_path = f"merged_{user_id}_{datetime.now().timestamp()}.mp3"
-        combined.export(output_path, format="mp3", bitrate="192k")
+        # *** পরিবর্তন: বিটরেট 192k থেকে 128k করা হয়েছে ***
+        combined.export(output_path, format="mp3", bitrate="128k")
         
         progress = 100
         text = f"✅ *মার্জ সম্পন্ন!*\n\n{get_progress_bar(progress)} {progress}%\n\nফাইল প্রস্তুত! ডাউনলোড করতে নিচের বাটনে ক্লিক করুন।"
@@ -632,11 +633,15 @@ async def create_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Cannot read audio duration: {e}")
             audio_duration = 0
         
-        # Optimized FFmpeg command
+        # *** পরিবর্তন: FFmpeg কমান্ড অপ্টিমাইজ করা হয়েছে ***
         cmd = [
             'ffmpeg', '-loop', '1', '-i', image_path, '-i', audio_path,
-            '-c:v', 'libx264', '-preset', 'medium', '-crf', '28', 
-            '-c:a', 'aac', '-b:a', '128k', '-pix_fmt', 'yuv420p', 
+            '-c:v', 'libx264', '-preset', 'medium', 
+            # CRF 28 থেকে 30 করা হয়েছে (বেশি কম্প্রেশন)
+            '-crf', '30', 
+            '-c:a', 'aac', '-b:a', '128k', '-pix_fmt', 'yuv420p',
+            # ভিডিও ফিল্টার যোগ করা হয়েছে (রেজোলিউশন কমানোর জন্য)
+            '-vf', "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1",
             '-shortest', '-movflags', '+faststart',
             '-y', output_video, '-progress', 'pipe:1', '-loglevel', 'error'
         ]
