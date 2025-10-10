@@ -255,7 +255,7 @@ async def add_more_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'last_activity': datetime.now()
     })
     
-    text = "➕ *আরো অডিও যোগ করুন*\n\nনতুন অডিও/ভয়েস পাঠান। শেষ হলে \"সম্পন্ন করুন\" ক্লিক করুন।"
+    text = "➕ *আরো অডিও যোগ করুন*\n\nনতুন অডিও/ভয়েস পাঠান। শেষ হলে \"সম্পন্ন করুন\" ক্লিক করুন۔"
     await safe_edit_message(context, user_id, user_data[user_id]['status_message_id'], text, get_done_button())
 
 
@@ -272,7 +272,7 @@ async def start_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'last_activity': datetime.now()
     })
     
-    text = "🎬 *ভিডিও বানানোর মোড*\n\n📸 প্রথমে একটি ছবি পাঠান।"
+    text = "🎬 *ভিডিও বানানোর মোড*\n\n📸 প্রথমে একটি ছবি পাঠান۔"
     await safe_edit_message(context, user_id, user_data[user_id]['status_message_id'], text, get_cancel_button())
 
 
@@ -347,40 +347,46 @@ async def process_incoming_audio(update: Update, context: ContextTypes.DEFAULT_T
     mode = user_data[user_id]['mode']
     status_id = user_data[user_id]['status_message_id']
     is_add_more = (mode == 'add_more')
-    
+
     file_list_key = 'new_audio_files' if is_add_more else 'audio_files'
     name_list_key = 'new_audio_names' if is_add_more else 'audio_names'
-    
+
     file_obj = update.message.audio or update.message.voice or update.message.document
-    
-    # Check file size (MAX 50MB)
-    if hasattr(file_obj, 'file_size') and file_obj.file_size > 50 * 1024 * 1024:
+
+    # Check file size (MAX 100MB instead of 50MB)
+    if hasattr(file_obj, 'file_size') and file_obj.file_size > 100 * 1024 * 1024:
         try:
             await context.bot.send_message(
                 chat_id=user_id,
-                text="❌ ফাইল খুব বড়! সর্বোচ্চ 50MB এর ফাইল পাঠান।"
+                text="❌ ফাইল খুব বড়! সর্বোচ্চ 100MB এর ফাইল পাঠান।"
             )
         except Exception:
             pass
         return
-    
+
     # Determine file extension
-    if update.message.audio:
-        file_extension = ".mp3"
-    elif update.message.voice:
+    if update.message.voice:
         file_extension = ".ogg"
-    else:
+    elif update.message.audio:
         file_extension = ".mp3"
-    
-    # FIXED: int() added to timestamp
+    else:
+        # For documents, try to detect format from mime type
+        mime_type = getattr(update.message.document, 'mime_type', '')
+        if 'ogg' in mime_type or 'opus' in mime_type:
+            file_extension = ".ogg"
+        elif 'wav' in mime_type:
+            file_extension = ".wav"
+        else:
+            file_extension = ".mp3"  # default
+
     file_path = f"audio_{user_id}_{len(user_data[user_id].get(file_list_key, []))}_{int(datetime.now().timestamp())}{file_extension}"
-    
+
     try:
         file_handle = await file_obj.get_file()
         await file_handle.download_to_drive(file_path)
-        
+
         file_name = getattr(file_obj, 'file_name', f"Audio {len(user_data[user_id].get(file_list_key, [])) + 1}")
-        
+
         if file_list_key not in user_data[user_id]:
             user_data[user_id][file_list_key] = []
         if name_list_key not in user_data[user_id]:
@@ -388,20 +394,27 @@ async def process_incoming_audio(update: Update, context: ContextTypes.DEFAULT_T
             
         user_data[user_id][file_list_key].append(file_path)
         user_data[user_id][name_list_key].append(file_name)
-        
+
         audio_count = len(user_data[user_id][file_list_key])
         audio_list = "\n".join([f"  {i+1}. {name}" for i, name in enumerate(user_data[user_id][name_list_key][-5:])])
         
         if audio_count > 5:
             audio_list += f"\n  ... এবং আরও {audio_count - 5}টি"
-        
+
         text = f"🎵 *অডিও মার্জ মোড*\n\n*যোগ করা অডিও: {audio_count}টি*\n{audio_list}\n\nআরো অডিও পাঠান অথবা \"সম্পন্ন করুন\" ক্লিক করুন।"
         await safe_edit_message(context, user_id, status_id, text, get_done_button())
-        
+
     except Exception as e:
         logger.error(f"Error processing audio: {e}")
-        text = "❌ অডিও প্রসেস করতে সমস্যা হয়েছে। আবার চেষ্টা করুন।"
-        await safe_edit_message(context, user_id, status_id, text, get_done_button())
+        error_type = type(e).__name__
+        if "MemoryError" in error_type or "OSError" in error_type:
+            error_msg = "❌ ফাইলটি খুব বড় বা মেমরি সমস্যা হচ্ছে। ছোট ফাইল পাঠান।"
+        elif "DecodingError" in error_type:
+            error_msg = "❌ অডিও ফাইলটি ক্ষতিগ্রস্ত বা সাপোর্টেড না। অন্য ফাইল পাঠান।"
+        else:
+            error_msg = f"❌ অডিও প্রসেস করতে সমস্যা হয়েছে ({error_type})। আবার চেষ্টা করুন।"
+        
+        await safe_edit_message(context, user_id, status_id, error_msg, get_done_button())
 
 
 async def process_video_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -410,22 +423,22 @@ async def process_video_audio(update: Update, context: ContextTypes.DEFAULT_TYPE
     
     file_obj = update.message.audio or update.message.voice or update.message.document
     
-    # Check file size (MAX 50MB)
-    if hasattr(file_obj, 'file_size') and file_obj.file_size > 50 * 1024 * 1024:
+    # Check file size (MAX 100MB instead of 50MB)
+    if hasattr(file_obj, 'file_size') and file_obj.file_size > 100 * 1024 * 1024:
         try:
             await context.bot.send_message(
                 chat_id=user_id,
-                text="❌ ফাইল খুব বড়! সর্বোচ্চ 50MB এর ফাইল পাঠান।"
+                text="❌ ফাইল খুব বড়! সর্বোচ্চ 100MB এর ফাইল পাঠান।"
             )
         except Exception:
             pass
         return
     
     # Determine file extension
-    if update.message.audio:
-        file_extension = ".mp3"
-    elif update.message.voice:
+    if update.message.voice:
         file_extension = ".ogg"
+    elif update.message.audio:
+        file_extension = ".mp3"
     else:
         file_extension = ".mp3"
     
@@ -482,10 +495,19 @@ async def merge_audios(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_durations = []
         for idx, audio_path in enumerate(all_files):
             try:
-                audio = AudioSegment.from_file(audio_path)
+                # OPTIMIZED: Use proper format detection to reduce memory usage
+                file_extension = audio_path.split('.')[-1].lower()
+                if file_extension in ['mp3', 'wav', 'ogg', 'm4a', 'flac']:
+                    audio = AudioSegment.from_file(audio_path, format=file_extension)
+                else:
+                    audio = AudioSegment.from_file(audio_path)
+                
                 duration = len(audio)
                 file_durations.append(duration)
                 total_duration += duration
+                
+                # Clear audio variable to free memory
+                del audio
                 
                 progress = 5 + int((idx + 1) / len(all_files) * 15)
                 text = f"⏳ *অডিও মার্জ হচ্ছে...*\n\n{get_progress_bar(progress)} {progress}%\n\nফাইল এনালাইজ করা হচ্ছে... ({idx + 1}/{len(all_files)})"
@@ -495,16 +517,25 @@ async def merge_audios(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"Error analyzing file {audio_path}: {e}")
                 file_durations.append(0)
         
-        # Step 3: Merge audio files with precise progress
+        # Step 3: Merge audio files with precise progress and memory optimization
         for idx, (audio_path, file_duration) in enumerate(zip(all_files, file_durations)):
             progress = 20 + int((current_duration / total_duration) * 70) if total_duration > 0 else 20
             text = f"⏳ *অডিও মার্জ হচ্ছে...*\n\n{get_progress_bar(progress)} {progress}%\n\nঅডিও মার্জ করা হচ্ছে... ({idx + 1}/{total_files})"
             await safe_edit_message(context, user_id, status_id, text)
             
             try:
-                audio = AudioSegment.from_file(audio_path)
+                # OPTIMIZED: Use proper format detection to reduce memory usage
+                file_extension = audio_path.split('.')[-1].lower()
+                if file_extension in ['mp3', 'wav', 'ogg', 'm4a', 'flac']:
+                    audio = AudioSegment.from_file(audio_path, format=file_extension)
+                else:
+                    audio = AudioSegment.from_file(audio_path)
+                
                 combined += audio
                 current_duration += file_duration
+                
+                # Clear audio variable to free memory
+                del audio
                 
                 # Update progress for every 5% change
                 new_progress = 20 + int((current_duration / total_duration) * 70) if total_duration > 0 else 20
@@ -514,6 +545,7 @@ async def merge_audios(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     
             except Exception as e:
                 logger.error(f"Error processing file {audio_path}: {e}")
+                # Continue with other files even if one fails
                 continue
         
         # Step 4: Export the merged file
@@ -601,7 +633,12 @@ async def create_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Get audio duration for progress calculation
         try:
-            audio = AudioSegment.from_file(audio_path)
+            # OPTIMIZED: Use proper format detection
+            file_extension = audio_path.split('.')[-1].lower()
+            if file_extension in ['mp3', 'wav', 'ogg', 'm4a', 'flac']:
+                audio = AudioSegment.from_file(audio_path, format=file_extension)
+            else:
+                audio = AudioSegment.from_file(audio_path)
             audio_duration = len(audio) / 1000.0
             logger.info(f"Audio duration: {audio_duration}s")
         except Exception as e:
